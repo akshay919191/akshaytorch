@@ -1,0 +1,21 @@
+# AkshayTorch
+
+Custom PyTorch extensions for memory-efficient deep learning on consumer GPUs.
+
+Built to train diffusion models from scratch on RTX 3050 (6GB VRAM).
+
+## Features (WIP)
+
+- Memory-efficient attention mechanisms (Triton)
+- Custom normalization layers (Welford's online algorithm)
+- Gradient checkpointing utilities
+- Mixed precision training helpers
+
+## Why?
+
+Training large models on limited VRAM requires custom optimizations
+that standard libraries don't provide. This is my solution.
+
+## Status
+
+🚧 Work in progress - building while learning Triton and implementing DDPM
