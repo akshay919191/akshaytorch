@@ -221,3 +221,181 @@ def matmul(x, y):
         return out.view(M)
     else:
         return out.view(*batch, M, N)
+
+
+#relu 
+@triton.jit
+def ReLUkernel(xptr , outptr , M , K , xstrm , xstrn , outstrx , outstry , MBLOCK: tl.constexpr , KBLOCK: tl.constexpr):
+    pid = tl.program_id(axis = 0)
+    row = pid  *MBLOCK + tl.arange(0 , MBLOCK)
+    offsets = tl.arange(0 , KBLOCK)
+
+    ptrx = xptr + row[: , None] * xstrm + offsets[None , :] * xstrn
+    ptrout = outptr + row[: , None] * outstrx + offsets[None , :] * outstry
+
+    for k in range(0 , K , KBLOCK):
+        mask = (row[: , None] < M) & ((k + offsets)[None , :] < K)
+
+        data = tl.load(ptrx , mask = mask , other = 0.0)
+        x = tl.where(data > 0 , data , 0.0)
+
+        tl.store(ptrout , x , mask = mask)
+        ptrx += KBLOCK * xstrn
+        ptrout += KBLOCK * outstry
+
+def ReLU(x):
+    org_shape = x.shape
+    if len(org_shape) == 1:
+        x_2d = x.view(1 , -1)
+    if len(org_shape) == 2:
+        x_2d = x
+    if len(org_shape) > 2:
+        x_2d = x.view(-1 , x.shape[-1])
+
+    M , K = x_2d.shape
+    Mblock = 128
+    kblock = 32
+
+    out = torch.empty_like(x_2d)
+
+    grid = ((M + Mblock - 1) // Mblock ,)
+
+    ReLUkernel[grid](x_2d , out , M , K , x_2d.stride()[0] , x_2d.stride()[1] , out.stride()[0] , out.stride()[1] , Mblock , kblock)
+
+    return out.view(org_shape)
+
+
+# concat
+@triton.jit
+def concatkernel(xptr , yptr , outptr , M , K , xstrm , xstrn , ystrm , ystrn , outstrx , outstry , MBLOCK: tl.constexpr , KBLOCK: tl.constexpr):
+    pid = tl.program_id(axis = 0)
+    row = pid * MBLOCK + tl.arange(0 , MBLOCK)
+    offsets = tl.arange(0 , KBLOCK)
+    catoffsets = tl.arange(0 , KBLOCK)
+
+    ptrx = xptr + row[: , None] * xstrm + offsets[None , :] * xstrn
+    ptry = yptr + row[: , None] * ystrm + offsets[None , :] * ystrn
+
+    ptroutleft = outptr + row[: , None] * outstrx + catoffsets[None , :] * outstry
+    ptroutright = ptroutleft + K * outstry
+
+    for k in range(0 , K , KBLOCK):
+        maskuniversal = (row[: , None] < M) & ((k + offsets)[None , :] < K)
+
+        left = tl.load(ptrx , mask = maskuniversal , other = 0.0)
+        right = tl.load(ptry , mask = maskuniversal , other = 0.0)
+
+
+        maskout = (row[:, None] < M) & ((k + offsets)[None, :] < K)
+
+        tl.store(ptroutleft , left , mask = maskout)
+        tl.store(ptroutright , right , mask = maskout)
+        ptrx += KBLOCK * xstrn
+        ptry += KBLOCK * ystrn
+        ptroutleft += KBLOCK * outstry
+        ptroutright += KBLOCK * outstry
+
+def cat(x , y):
+    org_shape = x.shape
+    if len(org_shape) == 1:
+        x_2d = x.view(1 , -1)
+    if len(org_shape) == 2:
+        x_2d = x
+    if len(org_shape) > 2:
+        x_2d = x.view(-1 , x.shape[-1])
+
+    org_y = y.shape
+    if len(org_y) == 1:
+        y_2d = y.view(1 , -1)
+    if len(org_y) == 2:
+        y_2d = y
+    if len(org_y) > 2:
+        y_2d = y.view(-1 , y.shape[-1])
+
+    M , K = x_2d.shape
+    out = torch.empty((M , 2*K) , device = 'cuda')
+
+    mblock , kblock = 128 , 32
+
+    grid = ((M + mblock - 1) // mblock,)
+
+    concatkernel[grid](x , y , out , M , K , x_2d.stride()[0] , x_2d.stride()[1] , y_2d.stride()[0] , y_2d.stride()[1] , out.stride()[0] , out.stride()[1] , mblock , kblock)
+    if len(org_shape) == 1:
+        return out.view(-1)
+
+    if len(org_shape) == 2:
+        return out
+
+    if len(org_shape) > 2:
+        new_shape = list(org_shape)
+        new_shape[-1] *= 2
+        return out.view(*new_shape)
+    
+
+# concat
+@triton.jit
+def concatkernel(xptr , yptr , outptr , M , K , xstrm , xstrn , ystrm , ystrn , outstrx , outstry , MBLOCK: tl.constexpr , KBLOCK: tl.constexpr):
+    pid = tl.program_id(axis = 0)
+    row = pid * MBLOCK + tl.arange(0 , MBLOCK)
+    offsets = tl.arange(0 , KBLOCK)
+    catoffsets = tl.arange(0 , KBLOCK)
+
+    ptrx = xptr + row[: , None] * xstrm + offsets[None , :] * xstrn
+    ptry = yptr + row[: , None] * ystrm + offsets[None , :] * ystrn
+
+    ptroutleft = outptr + row[: , None] * outstrx + catoffsets[None , :] * outstry
+    ptroutright = ptroutleft + K * outstry
+
+    for k in range(0 , K , KBLOCK):
+        maskuniversal = (row[: , None] < M) & ((k + offsets)[None , :] < K)
+
+        x = tl.load(ptrx , mask = maskuniversal , other = 0.0)
+        y = tl.load(ptry , mask = maskuniversal , other = 0.0)
+
+        left = tl.where(x > 0 , x , 0.0)
+        right = tl.where(y > 0 , y , 0.0)
+
+        maskout = (row[:, None] < M) & ((k + offsets)[None, :] < K)
+
+        tl.store(ptroutleft , left , mask = maskout)
+        tl.store(ptroutright , right , mask = maskout)
+        ptrx += KBLOCK * xstrn
+        ptry += KBLOCK * ystrn
+        ptroutleft += KBLOCK * outstry
+        ptroutright += KBLOCK * outstry
+
+def fusedcat(x , y):
+    org_shape = x.shape
+    if len(org_shape) == 1:
+        x_2d = x.view(1 , -1)
+    if len(org_shape) == 2:
+        x_2d = x
+    if len(org_shape) > 2:
+        x_2d = x.view(-1 , x.shape[-1])
+
+    org_y = y.shape
+    if len(org_y) == 1:
+        y_2d = y.view(1 , -1)
+    if len(org_y) == 2:
+        y_2d = y
+    if len(org_y) > 2:
+        y_2d = y.view(-1 , y.shape[-1])
+
+    M , K = x_2d.shape
+    out = torch.empty((M , 2*K) , device = 'cuda')
+
+    mblock , kblock = 128 , 32
+
+    grid = ((M + mblock - 1) // mblock,)
+
+    concatkernel[grid](x , y , out , M , K , x_2d.stride()[0] , x_2d.stride()[1] , y_2d.stride()[0] , y_2d.stride()[1] , out.stride()[0] , out.stride()[1] , mblock , kblock)
+    if len(org_shape) == 1:
+        return out.view(-1)
+
+    if len(org_shape) == 2:
+        return out
+
+    if len(org_shape) > 2:
+        new_shape = list(org_shape)
+        new_shape[-1] *= 2
+        return out.view(*new_shape)
