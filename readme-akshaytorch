@@ -2,13 +2,4 @@
 
 # 
 
-1. gelu -> it handles any shape you give , but for now i will take (B , C , H , W) , so our gelu will normalize with dim -1 as obvious
-
-2. fused residual kernel ->  it takes two inputs the x and the residual and and normalized (layer norm) with respect to dim = -1, which is  optimized for diffusion , takes any shape 
-
-3. matmul kernel -> takes any shape , matmul at last dims as per needed for diffusion 
-
-4. Relu -> takes any shape , relu norm
-
-5. concat and concatfused -> takes any shape and concat just concat and concat fused does concat along relu norm
-
+it works exactly same like pytorch .
