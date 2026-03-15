@@ -464,25 +464,20 @@ def groupnormkernel(xptr , outptr , eps , M , K , xstrm , xstrn , outstrm , outs
 
     
 def group_norm(x: torch.Tensor, num_groups: int, eps: float = 1e-5) -> torch.Tensor:
-
-    N, C = x.shape[:2]
+    N , C   = x.shape[:2] # why we did this? see kernel i am just pointing towards the sample group after that i treated as flattened
     spatial = x.numel() // (N * C)
 
-    assert C % num_groups == 0, "C must be divisible by num_groups"
-    channels_per_group = C // num_groups
+    assert (C % num_groups == 0) , "teri maa ka bhosda"
+    channelpergrp = C // num_groups
 
-    x_flat = x.contiguous().view(N, num_groups, channels_per_group * spatial)
+    x_flat = x.contiguous().view(N , num_groups , channelpergrp * spatial)
+    M , K  = 1 , channelpergrp * spatial #why ? becuase in flat we have only 1 row and all in columns
+    out = torch.zeros_like(x_flat)
 
-    M = 1          
-    K = channels_per_group * spatial
+    mblock = 1
+    kblock = triton.next_power_of_2(min(512 , K))
 
-    out = torch.empty_like(x_flat)
-
-    MBLOCK = 1
-    KBLOCK = triton.next_power_of_2(min(K, 1024))
-
-    grid = (N, num_groups, triton.cdiv(M, MBLOCK))
-
+    grid = (N , num_groups , triton.cdiv(M , mblock))
     groupnormkernel[grid](
         x_flat, out, eps,
         M, K,
@@ -490,8 +485,9 @@ def group_norm(x: torch.Tensor, num_groups: int, eps: float = 1e-5) -> torch.Ten
         out.stride(1),    out.stride(2),
         x_flat.stride(0),                    # batchstr
         x_flat.stride(1),                    # groupstr
-        MBLOCK=MBLOCK,
-        KBLOCK=KBLOCK,
+        MBLOCK=mblock,
+        KBLOCK=kblock,
     )
-
     return out.view_as(x)
+
+
