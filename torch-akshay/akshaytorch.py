@@ -399,3 +399,99 @@ def fusedcat(x , y):
         new_shape = list(org_shape)
         new_shape[-1] *= 2
         return out.view(*new_shape)
+    
+
+import torch , triton
+import triton.language as tl
+
+@triton.jit 
+def groupnormkernel(xptr , outptr , eps , M , K , xstrm , xstrn , outstrm , outstrn , batchstr , groupstr , MBLOCK: tl.constexpr , KBLOCK: tl.constexpr):
+    batchpid = tl.program_id(axis = 0)
+    grouppid = tl.program_id(axis = 1)
+
+    xpid = tl.program_id(axis = 2)
+
+    base = batchpid * batchstr + grouppid * groupstr
+
+    row = xpid * MBLOCK + tl.arange(0 , MBLOCK)
+    offsets = tl.arange(0 , KBLOCK)
+
+    ptrx = base + xptr + row[: , None] * xstrm + offsets[None , :] * xstrn
+
+    mean = 0.0
+    count = 0
+
+    for k in range(0 , K , KBLOCK):
+        maskx = (row[: , None] < M) & ((k + offsets)[None , :] < K)
+
+        x = tl.load(ptrx , mask = maskx , other = 0.0)
+
+        mean += tl.sum(x)
+        count += tl.sum(maskx.to(tl.int32))
+
+        ptrx += KBLOCK * xstrn
+    
+    mean = mean / count
+    ptrx = base + xptr + row[: , None] * xstrm + offsets[None , :] * xstrn
+
+    var = 0.0
+    for k in range(0 , K , KBLOCK):
+        maskx = (row[: , None] < M) & ((k + offsets)[None , :] < K)
+
+        x = tl.load(ptrx , mask = maskx , other = 0.0)
+
+        diff  = tl.where(maskx, x - mean, 0.0)         
+        var  += tl.sum(diff * diff)
+
+        ptrx += KBLOCK * xstrn
+    
+    var = var / count
+    inv_std = 1.0 / tl.sqrt(var + eps)
+    ptrx = base + xptr + row[: , None] * xstrm + offsets[None , :] * xstrn
+    ptr_out = base + outptr + row[:, None]*outstrm + offsets[None, :]*outstrn
+
+    for k in range(0, K, KBLOCK):
+        maskx = (row[:, None] < M) & ((k + offsets)[None, :] < K)
+        x = tl.load(ptrx, mask=maskx, other=0.0)
+
+        x = (x - mean) * inv_std
+        
+
+        tl.store(ptr_out, x, mask=maskx)
+        ptrx += KBLOCK * xstrn
+        ptr_out += KBLOCK * outstrn
+
+
+    
+def group_norm(x: torch.Tensor, num_groups: int, eps: float = 1e-5) -> torch.Tensor:
+
+    N, C = x.shape[:2]
+    spatial = x.numel() // (N * C)
+
+    assert C % num_groups == 0, "C must be divisible by num_groups"
+    channels_per_group = C // num_groups
+
+    x_flat = x.contiguous().view(N, num_groups, channels_per_group * spatial)
+
+    M = 1          
+    K = channels_per_group * spatial
+
+    out = torch.empty_like(x_flat)
+
+    MBLOCK = 1
+    KBLOCK = triton.next_power_of_2(min(K, 1024))
+
+    grid = (N, num_groups, triton.cdiv(M, MBLOCK))
+
+    groupnormkernel[grid](
+        x_flat, out, eps,
+        M, K,
+        x_flat.stride(1), x_flat.stride(2),
+        out.stride(1),    out.stride(2),
+        x_flat.stride(0),                    # batchstr
+        x_flat.stride(1),                    # groupstr
+        MBLOCK=MBLOCK,
+        KBLOCK=KBLOCK,
+    )
+
+    return out.view_as(x)
