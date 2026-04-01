@@ -1,10 +1,11 @@
 #include <iostream>
 #include <cuda_runtime.h>
+#define TILE 32
 
 __global__ void add(float* a , float* b , float* c , int n){
     int i = threadIdx.x + blockIdx.x * blockDim.x; // assigning threads kind of (giving each them specific id)
     if (i < n){ // confirming if number of threads 
-        c[i] = a[i] +    b[i];
+        c[i] = a[i] + b[i];
     }
 }
 
@@ -484,45 +485,50 @@ int main() {
     return 0;
 }
 
-#define TILE 16
+
 
 __global__ void tiledmatmul(float* A, float* B, float* out, int M, int N, int K) {
     __shared__ float tileA[TILE][TILE];
     __shared__ float tileB[TILE][TILE];
 
+    float sum = 0;
     int tx = threadIdx.x;
     int ty = threadIdx.y;
+
+    // row -->> tile size into block id + ty to points towards the first element of the tile, 
     int row = blockIdx.y * TILE + ty;
     int col = blockIdx.x * TILE + tx;
-          
-    float sum = 0.0f;
 
-    for (int i = 0; i < (K + TILE - 1) / TILE; i++) {
+    for(int i = 0 ; i < (K + TILE - 1) / TILE ; i++){ // why we used K here? -> K is the connecting dim of both matrix so it takes care of bounds
+        // now we need to load a tile from A and from B
+        // we have to take care of bounds because we make tiles the power of 2 but dims are not always so 
+        if(row < M && (TILE * i + tx) < K) // row should be less than M , because we load according to it , and the indicing we will use should be in bound too
+            // why we didn't bound tx and ty here? because these are threads ID we will launch kernel making sure it make sense
+            tileA[ty][tx] = A[row * K + (TILE * i + tx)]; // A[row][K] we have to load this , row can be any in tile like we can go from 0th - 15th row so it depends but to get to next row as row is only indicing pointers towards it , we need to tell it should jump this much so row * K and in each row we are bound to tile size may be it can be more than the tile size , so we will multiply TILE * i + tx (as we are loading columns in row) so this makes sure we iterate over each but this can overflow so we need to bound this too
+        else //  else we want it to be zero (you'll be wondering doesn't making it zero increase matrix size?? no it won't why? because for now we are not storing , and we are thinking in memory and check our conditioning in IF , so if it doesn't satisfy it , we are making it zero because at the end we are doing sum so it doesn't count at all)
+            tileA[ty][tx] = 0.0;
+            
+        // now same for tile B
+        if((TILE * i + ty) < K && col < N) // here indexing might be different , here we are doing B[k][col] notice on thing the stride for column is 1 (stride is the steps needed to jump over the same category , in row we have to jump over all columns so) so col will be as it is , what about k ? so we are jumping to next row in next iterat , so (TILE * i + ty) * N , why this because first we want to know which row number we are wanting to laod then we can just give stride to jump over it 
 
-        
-        if (row < M && (i * TILE + tx) < K)
-            tileA[ty][tx] = A[row * K + i * TILE + tx];
-        else
-            tileA[ty][tx] = 0.0f;
+            tileB[ty][tx] = B[(TILE * i + ty) * N + col];
+        else    
+            tileB[ty][tx] = 0.0;
 
-       
-        if (col < N && (i * TILE + ty) < K)
-            tileB[ty][tx] = B[(i * TILE + ty) * N + col];
-        else
-            tileB[ty][tx] = 0.0f;
+        // NOW before moving we want to load all tiles;so
+        __syncthreads();
 
-        __syncthreads();  
-
-        for (int k = 0; k < TILE; k++)
+        for (int k = 0 ; k < TILE ; k++){
             sum += tileA[ty][k] * tileB[k][tx];
+        }
 
-        __syncthreads();  
-    }
+        __syncthreads();
+    } 
 
-    if (row < M && col < N)
+    if(row < M && col < N)
         out[row * N + col] = sum;
-}
 
+}
 
 
 int main() {
@@ -544,7 +550,7 @@ int main() {
     float *d_A, *d_B, *d_C;
     cudaMalloc(&d_A, sizeA);
     cudaMalloc(&d_B, sizeB);
-    cudaMalloc(&d_C, sizeC);
+    cudaMalloc(&d_C, sizeC);    
 
     cudaMemcpy(d_A, h_A, sizeA, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, sizeB, cudaMemcpyHostToDevice);
@@ -586,4 +592,185 @@ int main() {
     free(h_A); free(h_B); free(h_C);
 
     return 0;
+}
+
+
+__global__ void tiledsoftmax(float* A , float* B , int M , int N){
+    __shared__ float tileA[TILE];
+    __shared__ float globalMAX;
+    __shared__ float sum;
+
+    int tx = threadIdx.x ; // its the thread id , thread id is max the tile size means 16
+    
+    /* now we need row indexes which are quite simple to find ,(disclaimer , row only points towards the first element)*/
+    int row = blockIdx.x;  
+
+    // we need a global max for each row
+    if (tx == 0) {
+        globalMAX = -FLT_MAX;    
+        sum       = 0.0f;
+    }
+    __syncthreads(); 
+    if(row >= M) return; //  safe exit 
+
+    // now we need to iterate through all the tile for max and write in tileA (it can be overwritten so we can use it multiple time)
+
+    for(int i = 0 ; i < (N + TILE - 1) / TILE ; i++){ // we got max for 1 block 
+        int col = i * TILE + tx;
+        float val = (col < N) ? A[row * N + col] : -FLT_MAX;
+        tileA[threadIdx.x] = val;
+        __syncthreads(); // 
+
+        for(int stride = TILE / 2 ; stride > 0 ; stride /= 2){
+            if (tx < stride)
+                tileA[tx] = fmaxf(tileA[tx] , tileA[tx + stride]);
+
+            __syncthreads();
+        } // now its reduced to all over tileA[0] the max one 
+
+        if(threadIdx.x == 0) // you can choose 0 or 0 - 15 any because all threads see value due to shared memory so to save compute we are using one thread to write into shared memeory instead of all threads do the same work overwriting for no reason
+            globalMAX = max(globalMAX , tileA[0]); // now we can grab the max one 
+        __syncthreads();
+    }
+
+    // now we will load each tile from a row , subtract the max , exponentialize each term , sum up that again do the fucking things then we are done
+    
+
+    for (int tileIdx = 0; tileIdx < (N + TILE - 1) / TILE; tileIdx++) {
+        int col = tileIdx * TILE + tx;
+        float val = (col < N) ? expf(A[row * N + col] - globalMAX) : 0.0f;
+        tileA[tx] = val;
+        __syncthreads();
+
+        // parallel reduction to sum
+        for (int stride = TILE / 2; stride > 0; stride /= 2) {
+            if (tx < stride)
+                tileA[tx] += tileA[tx + stride];
+            __syncthreads();
+        }
+
+        if (tx == 0)
+            sum += tileA[0];
+        __syncthreads();
+    }
+
+    for (int i = 0 ; i < (N + TILE - 1) / TILE ; i++){
+        int col = i * TILE + tx;
+        if (col < N)
+            B[row * N + col] = expf(A[row * N + col] - globalMAX) / sum;
+    }
+
+}
+
+int main(){
+    int M = 64 , N = 64;
+    int n = M * N;
+
+    size_t size = n * sizeof(float);
+    float* h_a = (float*)malloc(size); // its c style works for cpp too , but u can also go for new float[n]
+    float* h_b = (float*)malloc(size);
+
+    for(int i = 0 ; i < n ; i++) h_a[i] = 2.0f;
+
+    float *a , *b;
+    cudaMalloc(&a , size);
+    cudaMalloc(&b , size);
+
+    cudaMemcpy(a , h_a , size , cudaMemcpyHostToDevice);
+
+    int threadsPerBlock = TILE;
+    int blocksPerGrid = M;
+
+    tiledsoftmax<<<blocksPerGrid , threadsPerBlock>>>(a , b , M , N);
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_b , b , size , cudaMemcpyDeviceToHost);
+
+    std::cout << "Result matrix (partial):\n";
+    for (int i = 0; i < std::min(M, 5); i++) {
+        for (int j = 0; j < std::min(N, 5); j++) {
+            std::cout << h_b[i*N + j] << " ";
+        }
+        std::cout << "\n";
+    }
+
+    free(h_a);
+    free(h_b);
+    cudaFree(a);
+    cudaFree(b);
+}
+
+
+__global__ void transpose(float *A , float *B , int M  , int N){
+    __shared__ float tile[TILE][TILE + 1];
+
+    int row = threadIdx.y + blockIdx.y * TILE;
+    int col = threadIdx.x + blockIdx.x * TILE;
+
+    if (row < M && col < N)
+        tile[threadIdx.y][threadIdx.x] = A[row * N + col];
+    
+    __syncthreads();
+
+    int outrow = threadIdx.y + blockIdx.x * TILE;
+    int outcol = threadIdx.x + blockIdx.y * TILE;
+    
+    if (outrow < N && outcol < M)
+        B[outrow * M + outcol] = tile[threadIdx.x][threadIdx.y];
+
+}
+int main(){
+    int M = 4096 , N = 3084;
+    size_t size = M * N * sizeof(float); 
+    
+    float *h_a = new float[M * N];
+    float *h_out = new float[M * N];
+
+    for (int i = 0 ; i < M ; i++){
+        for (int j = 0 ; j < N ; j++){
+            h_a[i * N + j] = i * 3.0f + j;
+        }
+    }
+
+    float *a , *b;
+    cudaMalloc(&a , size);
+    cudaMalloc(&b , size);
+
+    cudaMemcpy(a , h_a , size , cudaMemcpyHostToDevice);
+    dim3 threadsPerBlock(16,16);
+    dim3 blocksPerGrid((N + 15) / 16 , (M + 15) / 16);
+
+
+
+
+   
+    transpose<<<blocksPerGrid, threadsPerBlock>>>(a, b, M, N);
+
+    cudaDeviceSynchronize();
+
+    cudaMemcpy(h_out , b , size , cudaMemcpyDeviceToHost);
+
+    // for (int i = 0 ; i < 4 ; i++){
+    //     for (int j = 0 ; j < 3 ; j++){
+    //         std::cout << h_a[i * N + j] << " ";
+    //     }
+    //     std::cout << "\n";
+    // }
+    // std::cout << "\n";
+
+    // for (int i = 0; i < N; i++) {        // rows = N
+    //     for (int j = 0; j < M; j++) {    // cols = M
+    //         std::cout << h_out[i * M + j] << " ";
+    //     }
+    //     std::cout << "\n";
+    // }
+
+    delete[] h_a;
+    delete[] h_out;
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    cudaFree(a);
+    cudaFree(b);
 }
