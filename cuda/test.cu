@@ -774,3 +774,169 @@ int main(){
     cudaFree(a);
     cudaFree(b);
 }
+
+
+#include <iostream>
+#include <cuda_runtime.h>
+#include <cmath>
+#include <float.h>
+
+#define TILE 32
+
+// we will be doin (softmax(Query @ key.T)) @ value
+
+__global__ void fusedattn(const float* __restrict__ Query 
+    , const float* __restrict__ KEY 
+    , const float* __restrict__ Value 
+    , float* __restrict__ weight , int _seq , int _d_model){
+
+    // we need to multiply these 2 without doin transpose 
+    int tx = threadIdx.x;
+    int row = blockIdx.x;
+
+    // making free space like __shared 
+    extern __shared__ float smen[];
+    float* scores = smen;
+    float* tileQ = smen + _seq;
+    float* tileK = tileQ + TILE;
+
+    // initialize the scores to be 0
+    for (int i = tx ; i < _seq ; i += TILE) //  its using all threads to make zero you can go in one go too
+        scores[i] = 0.0f;
+    __syncthreads();
+
+    // dot product
+    for (int t = 0 ; t < (TILE + _d_model - 1) / TILE ; t++){
+        int d = TILE * t + tx; // on which col(it covers whole row due to t)
+
+        tileQ[tx] = (row < _seq && d < _d_model) ? Query[d + row * _d_model] : 0.0f;
+        __syncthreads();
+
+        for(int i = 0 ; i < _seq ; i++){
+            float kval = (d < _d_model) ? KEY[i * _d_model + d] : 0.0f;
+            tileK[tx] = tileQ[tx] * kval;
+            __syncthreads();
+
+            for(int stride = TILE / 2 ; stride > 0 ; stride /= 2){
+                if(tx < stride) tileK[tx] += tileK[tx + stride];
+                __syncthreads();
+            }
+
+            if(tx == 0) scores[i] += tileK[0]; //  per element indexing
+            __syncthreads();
+        }
+    }   
+
+    // scaling 
+    float scale = 1.0f / sqrtf((float)_d_model);
+    for(int j = tx ; j < _seq ; j += TILE)
+        scores[j] *= scale;
+    __syncthreads();
+
+
+    __shared__ float smax;
+    if(tx == 0) smax = -FLT_MAX;
+    __syncthreads(); 
+    tileK[tx] = -FLT_MAX;
+    for(int k = tx ; k < _seq ; k += TILE)
+        tileK[tx] = fmaxf(tileK[tx] , scores[k]); //  if we have tile size of 8 amd we have 12 elements , we are making sure that the frist element on tileK is max of all TILE's nth elements means tileK[0] = max of its own and scores which have all 12 scores means scores of 0 and 8th elements so it makes sure it stays the same size despite calulating the max
+    __syncthreads();
+
+    for(int stride = TILE / 2 ; stride > 0 ; stride >>= 1)
+       {
+        if(tx < stride) tileK[tx] = fmaxf(tileK[tx] , tileK[tx + stride]);
+        __syncthreads();
+    }
+
+    if(tx == 0) smax = tileK[0];
+
+    // now same way , no extra loading do num - max;
+    for (int j = tx ; j < _seq ; j += TILE)
+        scores[j] = expf(scores[j] - smax);
+    __syncthreads();
+
+    __shared__ float ssum;
+    if (tx == 0) ssum = 0.0f;
+    __syncthreads();
+
+    tileK[tx] = 0.0f;
+    for (int j = tx; j < _seq; j += TILE) //  loading to tileK as we have fixed size so just adding all elements in to TILE size
+        tileK[tx] += scores[j];
+    __syncthreads();
+
+    for (int stride = TILE / 2; stride > 0; stride >>= 1)
+    {
+        if (tx < stride) tileK[tx] += tileK[tx + stride];
+        __syncthreads();
+    }
+    if (tx == 0) ssum = tileK[0];    
+    __syncthreads();
+
+    for (int j = tx; j < _seq; j += TILE)
+        scores[j] /= ssum;
+    __syncthreads();
+
+    for(int d = tx ; d < _d_model ; d += TILE){
+        float acc = 0;
+        for(int j = 0 ; j < _seq ; j++)
+            acc += scores[j] * Value[j * _d_model + d];
+        weight[row * _d_model + d] = acc;
+    }
+}
+
+
+
+void launch_fusedattn(const float* Q, const float* K, const float* V,
+                      float* out, int seq, int d_model)
+{
+    size_t smem = (seq + 2 * TILE) * sizeof(float);
+    fusedattn<<<seq, TILE, smem>>>(Q, K, V, out, seq, d_model);
+    cudaDeviceSynchronize();
+}
+
+int main()
+{
+    int seq     = 3;    
+    int d_model = 4;   
+
+    float* h_Q   = new float[seq * d_model];
+    float* h_K   = new float[seq * d_model];
+    float* h_V   = new float[seq * d_model];
+    float* h_out = new float[seq * d_model];
+
+    for (int i = 0; i < seq * d_model; i++)
+    {
+        h_Q[i] = 0.1f * i;
+        h_K[i] = 0.2f * i;
+        h_V[i] = 0.3f * i;
+    }
+
+    float *d_Q, *d_K, *d_V, *d_out;
+    cudaMalloc(&d_Q,   seq * d_model * sizeof(float));
+    cudaMalloc(&d_K,   seq * d_model * sizeof(float));
+    cudaMalloc(&d_V,   seq * d_model * sizeof(float));
+    cudaMalloc(&d_out, seq * d_model * sizeof(float));
+
+    cudaMemcpy(d_Q, h_Q, seq * d_model * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_K, h_K, seq * d_model * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_V, h_V, seq * d_model * sizeof(float), cudaMemcpyHostToDevice);
+
+    // run the kernel
+    launch_fusedattn(d_Q, d_K, d_V, d_out, seq, d_model);
+
+    cudaMemcpy(h_out, d_out, seq * d_model * sizeof(float), cudaMemcpyDeviceToHost);
+
+
+
+    std::cout << "Output (each row is out[token][d_model]):" << std::endl;
+    for (int i = 0; i < seq; i++)
+    {
+        for (int j = 0; j < d_model; j++)
+            std::cout << h_out[i * d_model + j] << " ";
+        std::cout << std::endl;
+    }
+
+    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V); cudaFree(d_out);
+    delete[] h_Q; delete[] h_K; delete[] h_V; delete[] h_out;
+    return 0;
+}
