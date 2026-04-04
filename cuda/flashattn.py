@@ -5,20 +5,16 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
-// N = seq len , num_head , d_model , d = d_model / num_head
 
 #define SEQ_LEN 2048
 #define D_MODEL 2048
 #define NUM_HEADS 16
 #define HEAD_DIM 64
 
-// M size on RTX 3050 is 64kb means 64000 we will go with 48kb just to not hit limit wihtout mistake
-// bc M / 4d => 48000 / 4 * 64 -> 192 , but as we need to divide it further we will take lesser but power of 2 which is 128
 
-// br is min of d and bc
+#define Br 32 // number of rows in query
+#define Bc 32 // number of rows in key and value
 
-#define Bc 32
-#define Br 32
 #define CHECK_CUDA(call)                                                    \
     do {                                                                    \
         cudaError_t err = (call);                                           \
@@ -28,150 +24,135 @@
             exit(EXIT_FAILURE);                                             \
         }                                                                   \
     } while (0)
-// divide query into Tr(8) (N / Br) number of blocks size Br * d 
-// same for key and value but by Bc Tc(4) (N / Bc) number of blocks of size Bc * d
 
-// via coding till 100 lines i realised getting what is br , bc , tr , tc will actually help a lot 
-
-/*
-
-here is the breakdown for them:
-br = is rows of tile query
-bc = is cols of tile key and val
-
-tr = threads for each row in tile query
-tc = threads for each col in tile key and value
-
-*/
-
-#define SCALE (1.0f / sqrtf((float)HEAD_DIM))
+#define SCALE 1.0f / sqrtf((float)HEAD_DIM)
 
 __global__ void FlashAttention(const float* __restrict__ query,
-        const float* __restrict__ key, // makin restrict for making it more efficient and optimized
-        const float* __restrict__ value,
-        float* __restrict__ output,
-        float* __restrict__ log,
-        int N , int d)
-
+                               const float* __restrict__ key,
+                               const float* __restrict__ value,
+                               float*       __restrict__ output,
+                               float*       __restrict__ log,
+                               int                       N,
+                               int                       d)
     {
-        // as working on we need atleast 3 Dim to just follow up
-        const int batchid = blockIdx.x; // tells to be on which batch
-        const int headid = blockIdx.y; // tells on which head group
-        const int tileid = blockIdx.z; // tells on which tile in head
-        const int tid = threadIdx.x; // thread id
+        // id's for fucking data
+        const int batchid = blockIdx.x ;
+        const int headid  = blockIdx.y ;
+        const int tileid  = blockIdx.z ;
+        const int tid     = threadIdx.x;
 
-        const int Tc = (N + Bc - 1) / Bc;
+        // making the fucking base to get to the point where we will be 
+        const long long base = (long long)batchid * NUM_HEADS * N * d // jump to correct batch 
+                          + (long long)headid * N * d ;// jump to correct head 
+
+        // point the the fucking location of data on which we are performing calculations
+        const float* Qptr = query  + base;
+        const float* Kptr = key    + base;
+        const float* Vptr = value  + base;
+        float*     outptr = output + base;
+
+        // now we at the fucking location now we can start , and stop u fuckin nigga , how the fuck you can start the main motive of flash attn was fast calc for which you'll need SRAM , for which u mf didn't allocated space yet , gop make it nigga
+        // we can do same as fused attn
+
+        extern __shared__ float smen[];
+        float* qshared   = smen  ;
+        float* kshared   = qshared + Br * HEAD_DIM ;// we used fucking this number because we are loading Br number of columns in one time for HEAD_DIM times means fucking row you fucking cumass , if you are thinking why we write it here go get fucked yourself , its ptr , so it will start from smen + Br * headdim , so this - smen is qshared size you mf because ptr points towards the first point
+        float* vshared   = kshared + Bc * HEAD_DIM ;
+        float* outshared = vshared + Bc * HEAD_DIM ;
+
+
+        const int q_row = tileid * Br + tid;
+        const bool validROW = (q_row < N);  
+
+        // now you are pointed toward the data , have fasted space available on your potato system , go start you bitch
         
-        const int q_row = tileid * Br + tid; // sequence position in row (note this only works on tile not actual query)
-        const bool validROW = (q_row < N);
+        // here is one problem we don't know the number of blocks we need to load for Key and value according to paper : https://arxiv.org/pdf/2205.14135
+        // we need Tc
 
-        // to make above positioning work we have to index , as we know GPU read data in contiguous memory , so we have to write strides for it
-        const long long stride_bh = (long long)N * d * NUM_HEADS; // its a batch jump stride(batch stride)
-        const long long base = (long long)batchid * (NUM_HEADS * N * d)
-                     + (long long)headid  * (N * d); // this makes jump to correct head (not tile yet)
+        const int Tc = (N + Bc - 1) / Bc; // number of kv tiles
 
-        // now we have pointed to head dim now to TILE
-        // reminder whenever we make a pointer to a array or a 2D or 3D or any dim it just points towards the first digit means 0 batch , 0 head dim , 0 tile , 0 tid
-        const float* Qptr = query + base; // this confirm that each thread we launch get its own and do not overlap , 
-        // same for others 
-        const float* Kptr = key + base;
-        const float* Vptr = value + base;
-        float*       Optr = output + base;
-
-
-        float* Lptr = log + (long long)batchid * NUM_HEADS * N
-                  + (long long)headid  * N; // have to take a look here
-
-        // now SRAM memory allocation
-        // we know from above query is loaded in Br and K n V are loadin in Bc
-        extern __shared__ float smem[];
-        float* qshared   = smem;
-        float* kshared   = qshared + Br * HEAD_DIM;
-        float* vshared   = kshared + Bc * HEAD_DIM;
-        float* outshared = vshared + Bc * HEAD_DIM;
-
-
-        // now we will load (listen this is not tiling so we will load once a element in to SRAM)
+        // according to fucking paper i mentioned they told to load the full row iteratively
+        // you can use fucking tiling here , i will make it after make this version work
         if(validROW){
-            for(int j = 0 ; j < d ; j++)
-                qshared[tid * d + j] = Qptr[q_row * d + j]; // here each threads is loading row in to SRAM(head dim)
-        } else {
-            for(int j = 0 ; j < d ; j++)
-                qshared[tid * d + j] = 0.0f;
-        } 
-        __syncthreads();
-        // why didn't we added syncthreads here i know it will overwrite it but then what do rest of threads will do , free?
+            for(int i = 0  ; i < d ; i++) qshared[tid * d + i] = Qptr[q_row * d + i];
+        } else{
+            for(int i = 0  ; i < d ; i++) qshared[tid * d + i] = 0.0f;
+        }
 
-        // now we have loaded a row (whole block(br * HEAD_DIM)) now we need acc to calculate max , sum
-        float m_i = -FLT_MAX; // each row max
-        float l_i = 0.0f; // each row sum
-        float out[HEAD_DIM] = {0} ; // output for one time
+        // loaded the fucking query one row
 
-        // bow to this part , fuck this part , this is the real mf , now we have to loop through K and  V track sum , max and do softmax
-    
-        //  as we have loaded the Q now we are looping through KV 
-        for(int i = 0 ; i < Tc ; i++){
-            // load K
-            // what we will do here , load a row -> save in to shared memory
-            for(int row = tid ; row < Bc ; row += Br){ //  its a tile means , there are Br number of threads in parallel
-                int index = i * Bc + row; // row index
-                if(index < N){
-                    for(int j = 0 ; j < d ; j++)
-                        kshared[row * d + j] = Kptr[index * d + j];
-                }else{
-                    for(int j = 0 ; j < d ; j++) kshared[row * d + j] = 0.0f;
+        // if you fucking know we are using online softmax , we need to update max and sum
+        float m_i = -FLT_MAX;
+        float l_i = 0.0f;
+        float o[HEAD_DIM] = {0}; // i fucking don't know this if i found i will fucking write it ,. now i knwo you mf , because the output at last is one row into one col which is head_dim size 
+
+        // now load the fucking K and V here
+        for(int kv_tile = 0 ; kv_tile < Tc ; kv_tile++){
+            // each tile have dim of Bc * d for both key and value
+
+            // we can't do the same as qshared , why? becuase we didn't declared a var like q_row so we need to loop through all tid and then all tid will loop through each element
+            // be careful here don't do j += Bc , becuase our query tile is size of Br so we need ot jump for same size
+            for(int rowID = tid ; rowID < Bc ; rowID += Br){
+                int cur_IDX = rowID + kv_tile * Bc; //  we are seeing on which row + which tile on row
+                //(cur_IDX < N){ // full size N , divided by size Bc in to Kv number of tiles so 
+                for(int iter = 0 ; iter < d ; iter++){
+                    if(cur_IDX < N) kshared[rowID * d + iter] = Kptr[cur_IDX * d + iter];
+                    else kshared[rowID * d + iter] = 0.0f;
                 }
             }
 
-            // same for V
-
-            for(int row = tid ; row < Bc ; row += Br){ 
-                int index = i * Bc + row; // row index
-                if(index < N){
-                    for(int j = 0 ; j < d ; j++)
-                        vshared[row * d + j] = Vptr[index * d + j];
-                }else{
-                    for(int j = 0 ; j < d ; j++) vshared[row * d + j] = 0.0f;
+            // now do for Value
+            for(int rowID = tid ; rowID < Bc ; rowID += Br){
+                int cur_IDX = rowID + kv_tile * Bc;
+                for(int iter = 0 ; iter < d ; iter++){
+                    if(cur_IDX < N) vshared[rowID * d + iter] = Vptr[cur_IDX * d + iter];
+                    else vshared[rowID * d + iter] = 0.0f;
                 }
             }
 
+            // now sync it so all threads are at same level
             __syncthreads();
 
-            // dot product 
-            // now we have to mult in col format and reduce it or just add it 
-            for(int tile = 0 ; tile < Bc ; tile ++){
-                float dot = 0.0f;
-                for (int j = 0 ; j < d ; j++)
-                    dot += qshared[tid * d + j] * kshared[tile * d + j];
-                int kvrow = i * Bc + tile;
-                outshared[tid * Bc + tile] = (kvrow < N) ? dot * SCALE : -FLT_MAX;
-            }
+            // now the dotproduct 
+            // see because in attn its obvious that all dims are same so the loaded dims are same even for shared memory
+            // so we gonna iterate over d terms because we loaded that much and sum it up and load it
+            // be careful we will load q for one time multiply it by all K loaded and sum each time and save it
 
-            // now online softmax 
-            // first find max
-            float m_tilde = -FLT_MAX;
-            for(int j = 0 ; j < Bc ; j++)
-                m_tilde = fmaxf(m_tilde , outshared[tid * Bc + j]);
-
-            float l_tilde = 0.0f;
-            for(int j = 0 ; j < Bc ; j++)
+            for(int rowID = 0 ; rowID < Bc ; rowID++)
             {
-                outshared[tid * Bc + j] = expf(outshared[tid * Bc + j] - m_tilde);
-                l_tilde += outshared[tid * Bc + j];
+                float dot = 0.0f;
+                for(int iter = 0 ; iter < d ; iter++)
+                    dot += qshared[tid * d + iter] * kshared[rowID * d + iter];
+                // now we gonna store in outshared for upcoming mess
+                int rowKV = kv_tile * Bc + rowID;
+                outshared[tid * Bc + rowID] = (rowKV < N) ? dot * SCALE : -FLT_MAX;
             }
 
-            // don't stress over it ,its online softmax part(read it lateR)
-            float m_new = fmaxf(m_i , m_tilde);
-            float l_new = expf(m_i - m_new) * l_i + expf(m_tilde - m_new) * l_tilde;
+            // now we are going for softmax so we will need a var to store max 
+            float m_tile = -FLT_MAX;
+            // shape of final is Br * Bc
+            for(int colID = 0 ; colID < Bc ; colID++)
+                m_tile = fmaxf(m_tile , outshared[tid * Bc + colID]);
 
-            float alpha = expf(m_i - m_new);
-            float beta = expf(m_tilde - m_new);
+            // per row 
+            float l_tile = 0.0f;
+            for(int colID = 0 ; colID < Bc ; colID++)
+                {
+                    outshared[tid * Bc + colID] = expf(m_tile - outshared[tid * Bc + colID]);
+                    l_tile += outshared[tid * Bc + colID];
+                }
 
-            for(int j = 0 ; j < d ; j++){
+            float m_new = fmaxf(m_tile , m_i);
+            float l_new = expf(m_i - m_new) * l_i + expf(m_tile - m_new) * l_tile;
+
+            float alpha = expf(m_i - m_new) , beta = expf(m_tile - m_new);
+
+            for(int col = 0 ; col < d ; col++)
+            {
                 float pv = 0.0f;
-                for (int col = 0 ; col < Bc ; col++)
-                    pv += outshared[tid * Bc + col] * vshared[col * d + j];
-                out[j] = alpha * out[j] + beta * pv;
+                for(int colID = 0 ; colID < Bc ; colID++)
+                    pv += outshared[tid * Bc + colID] * vshared[colID * d + col]; // indexing might look unfamiliar but outshared is size of Br * Bc so col is bounded to Bc and we are loading col in vshared so
+                o[col] = alpha * o[col] + beta * pv;
             }
 
             m_i = m_new;
@@ -181,112 +162,10 @@ __global__ void FlashAttention(const float* __restrict__ query,
         }
 
         if(validROW){
-            float l_inv = 1.0f / l_i;
-            for(int j = 0 ; j < d ; j++)
-                Optr[q_row * d + j] = out[j] * l_inv;
+            float l_inv = 1.0f / (float)l_i;
+            for(int col = 0 ; col < d ; col++)
+                outptr[q_row * d + col] = o[col] * l_inv;
+        }   
 
-            Lptr[q_row] = m_i + logf(l_i);
-        }
-}
-
-void launch_flash_attn(
-    const float* d_Q,   // device pointers [B, H, N, d]
-    const float* d_K,
-    const float* d_V,
-    float*       d_O,
-    float*       d_L,   // [B, H, N]
-    int batch_size,
-    int num_heads,
-    int seq_len,
-    int head_dim,
-    cudaStream_t stream = 0
-) {
-    const int Tr = (seq_len + Br - 1) / Br;
-    dim3 grid(batch_size, num_heads, Tr);
-    dim3 block(Br);
-
-    size_t smem = (size_t)(Br + Bc + Bc) * HEAD_DIM * sizeof(float)
-                + (size_t) Br * Bc * sizeof(float);
-
-
-
-    FlashAttention<<<grid, block, smem, stream>>>(d_Q, d_K, d_V, d_O, d_L,seq_len,head_dim);
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess)
-        printf("LAUNCH FAILED: %s\n", cudaGetErrorString(err));
-}
-
-int main() {
-    const int B = 4, H = NUM_HEADS, N = SEQ_LEN, d = HEAD_DIM;
-    const long long elems = (long long)B * H * N * d;
-
-    float* h_Q = (float*)malloc(elems * sizeof(float));
-    float* h_K = (float*)malloc(elems * sizeof(float));
-    float* h_V = (float*)malloc(elems * sizeof(float));
-    float* h_O = (float*)malloc(elems * sizeof(float));
-    float* h_L = (float*)malloc((long long)B * H * N * sizeof(float));
-
-    srand(42);
-    for (long long i = 0; i < elems; i++) {
-        h_Q[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
-        h_K[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
-        h_V[i] = ((float)rand() / RAND_MAX - 0.5f) * 0.1f;
     }
 
-    float *d_Q, *d_K, *d_V, *d_O, *d_L;
-    CHECK_CUDA(cudaMalloc(&d_Q, elems * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_K, elems * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_V, elems * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_O, elems * sizeof(float)));
-    CHECK_CUDA(cudaMalloc(&d_L, (long long)B * H * N * sizeof(float)));
-
-    CHECK_CUDA(cudaMemcpy(d_Q, h_Q, elems * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_K, h_K, elems * sizeof(float), cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(d_V, h_V, elems * sizeof(float), cudaMemcpyHostToDevice));
-
-
-    for (int i = 0; i < 3; i++)
-        launch_flash_attn(d_Q, d_K, d_V, d_O, d_L, B, H, N, d);
-    CHECK_CUDA(cudaDeviceSynchronize());
-    cudaDeviceProp prop;
-    cudaGetDeviceProperties(&prop, 0);
-    printf("maxGridSize = (%d, %d, %d)\n",
-        prop.maxGridSize[0],
-        prop.maxGridSize[1],
-        prop.maxGridSize[2]);
-
-    const int RUNS = 100;
-    cudaEvent_t t0, t1;
-    CHECK_CUDA(cudaEventCreate(&t0));
-    CHECK_CUDA(cudaEventCreate(&t1));
-
-    CHECK_CUDA(cudaEventRecord(t0));
-    for (int i = 0; i < RUNS; i++)
-        launch_flash_attn(d_Q, d_K, d_V, d_O, d_L, B, H, N, d);
-    CHECK_CUDA(cudaEventRecord(t1));
-    CHECK_CUDA(cudaEventSynchronize(t1));   // ← wait inside the window
-
-    float total_ms = 0.0f;
-    CHECK_CUDA(cudaEventElapsedTime(&total_ms, t0, t1));
-    float avg_ms = total_ms / RUNS;
-
-
-    double flops     = 4.0 * H * N * N * d;
-    double tflops    = (flops / (avg_ms * 1e-3)) / 1e12;
-
-    CHECK_CUDA(cudaMemcpy(h_O, d_O, elems * sizeof(float), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(h_L, d_L, (long long)B * H * N * sizeof(float), cudaMemcpyDeviceToHost));
-
-    bool ok = true;
-    for (long long i = 0; i < elems; i++) {
-        if (!isfinite(h_O[i])) { ok = false; break; }
-    }
-    printf("  Output check    : %s\n", ok ? "PASSED ✓" : "FAILED ✗");
-    printf("─────────────────────────────────────────\n");
-
-    // ── Cleanup ───────────────────────────────────────────────────────────────
-    cudaFree(d_Q); cudaFree(d_K); cudaFree(d_V);
-    cudaFree(d_O); cudaFree(d_L);
-    free(h_Q); free(h_K); free(h_V); free(h_O); free(h_L);
-    return ok ? 0 : 1;
-}
