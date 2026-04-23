@@ -1,171 +1,326 @@
 #include <cuda.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
-#include <float.h>
 #include <math.h>
-#include <stdio.h>
-#include <stdlib.h>
+#include <float.h>
+#include <iostream>
 
-#define SEQ_LEN 2048
+#define SEQ_LEN 2048        
 #define D_MODEL 2048
-#define NUM_HEADS 16
-#define HEAD_DIM 64
+#define NUM_HEADS 8
+#define HEAD_DIM 256
 
+#define Br 64  // for query
+#define Bc 32  // for key and value
 
-#define Br 32 // number of rows in query
-#define Bc 32 // number of rows in key and value
+#define SCALE (1.0f / sqrtf((float)HEAD_DIM))
 
-#define CHECK_CUDA(call)                                                    \
-    do {                                                                    \
-        cudaError_t err = (call);                                           \
-        if (err != cudaSuccess) {                                           \
-            fprintf(stderr, "CUDA error %s:%d  %s\n",                      \
-                    __FILE__, __LINE__, cudaGetErrorString(err));           \
-            exit(EXIT_FAILURE);                                             \
-        }                                                                   \
-    } while (0)
+__global__ void FlashAttention(
+    const half* __restrict__ Q,
+    const half* __restrict__ K,
+    const half* __restrict__ V,
+    half*       __restrict__ out,
+    int seq_len , int d_model)
 
-#define SCALE 1.0f / sqrtf((float)HEAD_DIM)
+{
+    __align__(16) extern __shared__ __half smem[];
 
-__global__ void FlashAttention(const float* __restrict__ query,
-                               const float* __restrict__ key,
-                               const float* __restrict__ value,
-                               float*       __restrict__ output,
-                               float*       __restrict__ log,
-                               int                       N,
-                               int                       d)
+    __half* smenA    = smem;
+    __half* smenB    = smenA    + 16  * 16;
+    __half* qshared  = smenB    + 16  * 8;
+    __half* kshared = qshared  + 8   * HEAD_DIM;
+    __half* vshared  = kshared + 4   * HEAD_DIM; 
+    float*  output   = (float*)(vshared + 32 * HEAD_DIM); // V
+    float* m = (float*)(output + 64 * 32);  
+    float* l = m + 64;       
+    float* alpha_s = l + 64;   // 64 floats
+    float* beta_s  = alpha_s + 64;                
+
+    const int batchid = blockIdx.x;
+    const int headid  = blockIdx.y;
+    const int tileid  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    const int lane  = tid % 32;
+    const int group = lane / 4; 
+
+    const long long base = (long long)batchid * NUM_HEADS * seq_len * d_model + 
+                (long long)headid * seq_len * d_model;
+
+    const half* Qptr = Q   + base;
+    const half* Kptr = K   + base;
+    const half* Vptr = V   + base;
+          half* optr = out + base;
+    
+    // tile id -- 2048 * 256 / 64 * 32 -> 32 * 8 = 256 (for query)
+    // total rows and total cols -- 256 / 32 - 8 cols and 2048 / 64 - 32 rows (for query)
+
+    // total rows and total cols -- 256 / 32 - 8 cols and 2048 / 32 - 64 rows (for query)
+    for(int i = tid ; i < 64 ; i += blockDim.x)
+        m[i] = -FLT_MAX , l[i] = 0.f;
+
+    __syncthreads();
+
+    const int rowtileID = tileid;
+    for(int rowid = 0 ; rowid < 64 ; rowid++)
     {
-        // id's for fucking data
-        const int batchid = blockIdx.x ;
-        const int headid  = blockIdx.y ;
-        const int tileid  = blockIdx.z ;
-        const int tid     = threadIdx.x;
+        for(int i = tid ; i < 64 * 32 ; i += blockDim.x)
+            output[i] = 0.f;
+        __syncthreads();
 
-        // making the fucking base to get to the point where we will be 
-        const long long base = (long long)batchid * NUM_HEADS * N * d // jump to correct batch 
-                          + (long long)headid * N * d ;// jump to correct head 
-
-        // point the the fucking location of data on which we are performing calculations
-        const float* Qptr = query  + base;
-        const float* Kptr = key    + base;
-        const float* Vptr = value  + base;
-        float*     outptr = output + base;
-
-        // now we at the fucking location now we can start , and stop u fuckin nigga , how the fuck you can start the main motive of flash attn was fast calc for which you'll need SRAM , for which u mf didn't allocated space yet , gop make it nigga
-        // we can do same as fused attn
-
-        extern __shared__ float smen[];
-        float* qshared   = smen  ;
-        float* kshared   = qshared + Br * HEAD_DIM ;// we used fucking this number because we are loading Br number of columns in one time for HEAD_DIM times means fucking row you fucking cumass , if you are thinking why we write it here go get fucked yourself , its ptr , so it will start from smen + Br * headdim , so this - smen is qshared size you mf because ptr points towards the first point
-        float* vshared   = kshared + Bc * HEAD_DIM ;
-        float* outshared = vshared + Bc * HEAD_DIM ;
-
-
-        const int q_row = tileid * Br + tid;
-        const bool validROW = (q_row < N);  
-
-        // now you are pointed toward the data , have fasted space available on your potato system , go start you bitch
-        
-        // here is one problem we don't know the number of blocks we need to load for Key and value according to paper : https://arxiv.org/pdf/2205.14135
-        // we need Tc
-
-        const int Tc = (N + Bc - 1) / Bc; // number of kv tiles
-
-        // according to fucking paper i mentioned they told to load the full row iteratively
-        // you can use fucking tiling here , i will make it after make this version work
-        if(validROW){
-            for(int i = 0  ; i < d ; i++) qshared[tid * d + i] = Qptr[q_row * d + i];
-        } else{
-            for(int i = 0  ; i < d ; i++) qshared[tid * d + i] = 0.0f;
-        }
-
-        // loaded the fucking query one row
-
-        // if you fucking know we are using online softmax , we need to update max and sum
-        float m_i = -FLT_MAX;
-        float l_i = 0.0f;
-        float o[HEAD_DIM] = {0}; // i fucking don't know this if i found i will fucking write it ,. now i knwo you mf , because the output at last is one row into one col which is head_dim size 
-
-        // now load the fucking K and V here
-        for(int kv_tile = 0 ; kv_tile < Tc ; kv_tile++){
-            // each tile have dim of Bc * d for both key and value
-
-            // we can't do the same as qshared , why? becuase we didn't declared a var like q_row so we need to loop through all tid and then all tid will loop through each element
-            // be careful here don't do j += Bc , becuase our query tile is size of Br so we need ot jump for same size
-            for(int rowID = tid ; rowID < Bc ; rowID += Br){
-                int cur_IDX = rowID + kv_tile * Bc; //  we are seeing on which row + which tile on row
-                //(cur_IDX < N){ // full size N , divided by size Bc in to Kv number of tiles so 
-                for(int iter = 0 ; iter < d ; iter++){
-                    if(cur_IDX < N) kshared[rowID * d + iter] = Kptr[cur_IDX * d + iter];
-                    else kshared[rowID * d + iter] = 0.0f;
-                }
-            }
-
-            // now do for Value
-            for(int rowID = tid ; rowID < Bc ; rowID += Br){
-                int cur_IDX = rowID + kv_tile * Bc;
-                for(int iter = 0 ; iter < d ; iter++){
-                    if(cur_IDX < N) vshared[rowID * d + iter] = Vptr[cur_IDX * d + iter];
-                    else vshared[rowID * d + iter] = 0.0f;
-                }
-            }
-
-            // now sync it so all threads are at same level
-            __syncthreads();
-
-            // now the dotproduct 
-            // see because in attn its obvious that all dims are same so the loaded dims are same even for shared memory
-            // so we gonna iterate over d terms because we loaded that much and sum it up and load it
-            // be careful we will load q for one time multiply it by all K loaded and sum each time and save it
-
-            for(int rowID = 0 ; rowID < Bc ; rowID++)
-            {
-                float dot = 0.0f;
-                for(int iter = 0 ; iter < d ; iter++)
-                    dot += qshared[tid * d + iter] * kshared[rowID * d + iter];
-                // now we gonna store in outshared for upcoming mess
-                int rowKV = kv_tile * Bc + rowID;
-                outshared[tid * Bc + rowID] = (rowKV < N) ? dot * SCALE : -FLT_MAX;
-            }
-
-            // now we are going for softmax so we will need a var to store max 
-            float m_tile = -FLT_MAX;
-            // shape of final is Br * Bc
-            for(int colID = 0 ; colID < Bc ; colID++)
-                m_tile = fmaxf(m_tile , outshared[tid * Bc + colID]);
-
-            // per row 
-            float l_tile = 0.0f;
-            for(int colID = 0 ; colID < Bc ; colID++)
+        for(int coltileID = 0 ; coltileID < 8 ; coltileID++)
+        {
+            for(int i = tid ; i < 64 * 32 ; i += blockDim.x)
                 {
-                    outshared[tid * Bc + colID] = expf(m_tile - outshared[tid * Bc + colID]);
-                    l_tile += outshared[tid * Bc + colID];
+                    int r = i / 32;
+                    int c = i % 32;
+
+                    qshared[r * 32 + c] = Qptr[rowtileID * 64 * 256 + coltileID * 32 + r * 256 + c];
                 }
 
-            float m_new = fmaxf(m_tile , m_i);
-            float l_new = expf(m_i - m_new) * l_i + expf(m_tile - m_new) * l_tile;
+            for(int i = tid ; i < 32 * 32 ; i += blockDim.x)
+                {
+                    int r = i / 32;
+                    int c = i % 32;
 
-            float alpha = expf(m_i - m_new) , beta = expf(m_tile - m_new);
+                    kshared[c * 32 + r] = Kptr[rowid * 32 * 256 + coltileID * 32 + r * 256 + c];
+                }
 
-            for(int col = 0 ; col < d ; col++)
+            // we loaded Q and K.T , 64 * 32 and 32 * 32
+            
             {
-                float pv = 0.0f;
-                for(int colID = 0 ; colID < Bc ; colID++)
-                    pv += outshared[tid * Bc + colID] * vshared[colID * d + col]; // indexing might look unfamiliar but outshared is size of Br * Bc so col is bounded to Bc and we are loading col in vshared so
-                o[col] = alpha * o[col] + beta * pv;
+                const int totalrows = 4;
+                for(int rowidxx = 0 ; rowidxx < totalrows ; rowidxx++)
+                {
+                    for(int coll = 0 ; coll < 4 ; coll++)
+                    {
+                        float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
+
+                        for(int cc = 0 ; cc < 2 ; cc++)
+                        {
+                            for(int i = tid ; i < 256 ; i += blockDim.x)
+                                { 
+                                    int r = i / 16;
+                                    int c = i % 16;
+
+                                    smenA[r * 16 + c] = qshared[rowidxx * 32 * 16 + cc * 16 + r * 32 + c];
+                                }
+                            
+                            for(int i = tid ; i < 128 ; i += blockDim.x)
+                                {
+                                    int r = i / 8;
+                                    int c = i % 8;
+                                    // have doubt in this indexing
+                                    smenB[r * 8 + c] = kshared[coll * 8 + cc * 16 * 32 + r * 32 + c];
+                                }
+
+                            __syncthreads();
+                            const int col0 = (lane % 4) * 2;
+                            const int col1 = col0 + 8;
+
+                            uint32_t a_frag[4];
+                            a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + col0]);
+                            a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + col0]);
+                            a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + col1]);
+                            a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + col1]);
+
+                            const int r0 = (lane % 4) * 2;
+                            const int r1 = r0 + 8;
+
+                            uint32_t b_frag[2];
+                            b_frag[0] = (uint32_t(__half_as_ushort(smenB[r0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r0 + 1) * 8 + group])) << 16));
+
+                            b_frag[1] = (uint32_t(__half_as_ushort(smenB[r1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r1 + 1) * 8 + group])) << 16));
+
+                            __syncthreads();
+                            asm volatile(
+                                "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                                "{%0,%1,%2,%3},"
+                                "{%4,%5,%6,%7},"
+                                "{%8,%9},"
+                                "{%10,%11,%12,%13};"
+                                    : "=f"(d1), "=f"(d2), "=f"(d3), "=f"(d4)
+                                    : "r"(a_frag[0]), "r"(a_frag[1]),
+                                    "r"(a_frag[2]), "r"(a_frag[3]),
+                                    "r"(b_frag[0]), "r"(b_frag[1])
+                                    ,"f"(d1),"f"(d2),"f"(d3),"f"(d4)
+                                );
+
+
+                        }
+                        const int r0 = group;
+                        const int r1 = r0 + 8;
+                        const int c0 = (lane % 4) * 2;
+                        const int c1 = c0 + 1;
+
+
+                        output[(rowidxx * 16 + r0) * 32 + coll * 8 + c0] += d1 * SCALE;
+                        output[(rowidxx * 16 + r0) * 32 + coll * 8 + c1] += d2 * SCALE;
+                        output[(rowidxx * 16 + r1) * 32 + coll * 8 + c0] += d3 * SCALE;
+                        output[(rowidxx * 16 + r1) * 32 + coll * 8 + c1] += d4 * SCALE;
+
+                    }
+                }
+            } // here one Q @ K.T 
+            
+        }
+        //load V // we will load 32 * 256
+        // it depends on rowid 
+
+        for(int i = tid ; i < 8192 ; i += blockDim.x)
+        {
+            int r = i / 256;
+            int c = i % 256;
+            vshared[r * 256 + c] = Vptr[rowid * 256 * 32 + r * 256 + c];
+        }
+        __syncthreads();
+
+        // start actual softmax
+        // output is  64 * 32
+        if(tid < 64)
+        {
+            float m_tile = -FLT_MAX;
+            float l_tile = 0.f;
+            
+            for(int c = 0; c < 32; c++)
+                m_tile = fmaxf(m_tile, output[tid * 32 + c]);
+
+            for(int c = 0; c < 32; c++)
+            {
+                output[tid * 32 + c] = expf(output[tid * 32 + c] - m_tile);
+                l_tile += output[tid * 32 + c];
             }
 
-            m_i = m_new;
-            l_i = l_new;
-            __syncthreads();
 
+            float m_old = m[tid];
+            float m_new = fmaxf(m_old, m_tile);
+            alpha_s[tid] = expf(m_old - m_new);
+            beta_s[tid]  = expf(m_tile - m_new);
+
+            l[tid] = alpha_s[tid] * l[tid] + beta_s[tid] * l_tile;
+            m[tid] = m_new;
+         
         }
+        __syncthreads();
 
-        if(validROW){
-            float l_inv = 1.0f / (float)l_i;
-            for(int col = 0 ; col < d ; col++)
-                outptr[q_row * d + col] = o[col] * l_inv;
-        }   
 
+        /*
+        .... do scores * V here
+        */
+        const int itr = 256 / 8;    // = 32;
+        const int rowitr = 64 / 16; // = 4;
+
+        for(int iter = 0 ; iter < rowitr ; iter++)
+        {
+            for(int colitr = 0 ; colitr < itr ; colitr++)
+            {
+                float d1 = 0.f , d2 = 0.f , d3 = 0.f , d4 = 0.f;
+                
+                for(int cc = 0 ; cc < 2 ; cc++)
+                {
+                    for(int i = tid ; i < 256 ; i += blockDim.x)
+                    {
+                        int r = i / 16;
+                        int c = i % 16;
+
+                        smenA[r * 16 + c] = __float2half_rn(output[iter * 16 * 32 + cc * 16 + r * 32 + c]);
+                    }
+
+                    for(int i = tid ; i < 128 ; i += blockDim.x)
+                    {
+                        int r = i / 8;
+                        int c = i % 8;
+
+                        smenB[r * 8 + c] = vshared[(cc * 16 + r) * 256 + colitr * 8 + c];
+                    }
+                    __syncthreads();
+
+                    // we got both smen perfectly
+                    const int col0 = (lane % 4) * 2;
+                    const int col1 = col0 + 8;
+
+                    uint32_t a_frag[4];
+                    a_frag[0] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + col0]);
+                    a_frag[1] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + col0]);
+                    a_frag[2] = *reinterpret_cast<const uint32_t*>(&smenA[ group      * 16 + col1]);
+                    a_frag[3] = *reinterpret_cast<const uint32_t*>(&smenA[(group + 8) * 16 + col1]);
+
+                    const int r0 = (lane % 4) * 2;
+                    const int r1 = r0 + 8;
+
+                    uint32_t b_frag[2];
+                    b_frag[0] = (uint32_t(__half_as_ushort(smenB[r0 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r0 + 1) * 8 + group])) << 16));
+
+                    b_frag[1] = (uint32_t(__half_as_ushort(smenB[r1 * 8 + group])) | (uint32_t(__half_as_ushort(smenB[(r1 + 1) * 8 + group])) << 16));
+
+                    __syncthreads();
+                    asm volatile(
+                        "mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 "
+                        "{%0,%1,%2,%3},"
+                        "{%4,%5,%6,%7},"
+                        "{%8,%9},"
+                        "{%10,%11,%12,%13};"
+                            : "=f"(d1), "=f"(d2), "=f"(d3), "=f"(d4)
+                            : "r"(a_frag[0]), "r"(a_frag[1]),
+                            "r"(a_frag[2]), "r"(a_frag[3]),
+                            "r"(b_frag[0]), "r"(b_frag[1])
+                            ,"f"(d1),"f"(d2),"f"(d3),"f"(d4)
+                        );
+
+                }
+
+                    const int roww = rowtileID * 64 * 256 + iter * 16 * 256;
+                    const int colbase = colitr * 8;
+
+
+                    const int rr0 = group;
+                    const int rr1 = rr0 + 8;
+                    const int cc0 = (lane % 4) * 2;
+                    const int cc1 = cc0 + 1;
+
+                    int actual_row0 = iter * 16 + rr0;  
+                    int actual_row1 = iter * 16 + rr1;  
+
+                    float aa = __half2float(optr[roww + colbase + rr0 * 256 + cc0]);
+                    float ab = __half2float(optr[roww + colbase + rr0 * 256 + cc1]);
+                    float ac = __half2float(optr[roww + colbase + rr1 * 256 + cc0]);
+                    float ad = __half2float(optr[roww + colbase + rr1 * 256 + cc1]);
+
+                    aa = alpha_s[actual_row0] * aa + beta_s[actual_row0] * d1;
+                    ab = alpha_s[actual_row0] * ab + beta_s[actual_row0] * d2;
+                    ac = alpha_s[actual_row1] * ac + beta_s[actual_row1] * d3;
+                    ad = alpha_s[actual_row1] * ad + beta_s[actual_row1] * d4;
+
+                    optr[roww + colbase + rr0 * 256 + cc0] = __float2half(aa);
+                    optr[roww + colbase + rr0 * 256 + cc1] = __float2half(ab);
+                    optr[roww + colbase + rr1 * 256 + cc0] = __float2half(ac);
+                    optr[roww + colbase + rr1 * 256 + cc1] = __float2half(ad);
+
+                // if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+                //     threadIdx.x < 12 && iter == 0 && colitr == 0)
+                // {
+                //     int idx00 = roww + colbase + rr0 * 256 + cc0;
+                //     int idx01 = roww + colbase + rr0 * 256 + cc1;
+                //     int idx10 = roww + colbase + rr1 * 256 + cc0;
+                //     int idx11 = roww + colbase + rr1 * 256 + cc1;
+
+                //     printf("tid=%d -> (%d,%d,%d,%d)\n",
+                //         threadIdx.x, idx00, idx01, idx10, idx11);
+                // }
+
+            }
+        }
+        //
+    }
+    // actual last scaling here
+    
+    for(int idx = tid; idx < 64 * 256; idx += blockDim.x)
+    {
+        int r = idx / 256;
+        int c = idx % 256;
+        float linv = __fdividef(1.0f, l[r]);
+        int global_idx = rowtileID * 64 * 256 + r * 256 + c;
+        optr[global_idx] = __float2half(__half2float(optr[global_idx]) * linv);
     }
 
+}
