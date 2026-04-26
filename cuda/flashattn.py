@@ -70,13 +70,17 @@ __global__ void FlashAttention(
 
         for(int coltileID = 0 ; coltileID < 8 ; coltileID++)
         {
-            for(int i = tid ; i < 64 * 32 ; i += blockDim.x)
-                {
-                    int r = i / 32;
-                    int c = i % 32;
+            // 64 rows, 4 float4s per row
+            for(int i = tid; i < 64 * 4; i += blockDim.x)
+            {
+                int r     = i / 4;    // which row (0..63)
+                int chunk = i % 4;    // which float4 within the row (0..3), covers cols 0,8,16,24
 
-                    qshared[r * 32 + c] = Qptr[rowtileID * 64 * 256 + coltileID * 32 + r * 256 + c];
-                }
+                *reinterpret_cast<float4*>(&qshared[r * 32 + chunk * 8]) =
+                *reinterpret_cast<const float4*>(
+                    &Qptr[rowtileID * 64 * 256 + coltileID * 32 + r * 256 + chunk * 8]);
+            }
+
 
             for(int i = tid ; i < 32 * 32 ; i += blockDim.x)
                 {
@@ -167,11 +171,11 @@ __global__ void FlashAttention(
         //load V // we will load 32 * 256
         // it depends on rowid 
 
-        for(int i = tid ; i < 8192 ; i += blockDim.x)
+        // 8192 halfs / 8 per float4 = 1024 iterations
+        for(int i = tid; i < 1024; i += blockDim.x)
         {
-            int r = i / 256;
-            int c = i % 256;
-            vshared[r * 256 + c] = Vptr[rowid * 256 * 32 + r * 256 + c];
+            *reinterpret_cast<float4*>(&vshared[i * 8]) =
+            *reinterpret_cast<const float4*>(&Vptr[rowid * 32 * 256 + i * 8]);
         }
         __syncthreads();
 
