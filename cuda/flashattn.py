@@ -114,7 +114,7 @@ __global__ void FlashAttention(
                                 {
                                     int r = i / 8;
                                     int c = i % 8;
-                                    // have doubt in this indexing
+                                    
                                     smenB[r * 8 + c] = kshared[coll * 8 + cc * 16 * 32 + r * 32 + c];
                                 }
 
